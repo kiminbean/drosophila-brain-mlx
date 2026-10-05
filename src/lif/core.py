@@ -13,8 +13,14 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
+
+try:
+    import mlx.core as mx
+except ImportError:  # CPU hosts (x86 Linux): numpy Packs + lif.engine_np lane.
+    # Every construction site below branches on this; the Metal/kernel lanes
+    # stay import-error-gated in their own modules.
+    mx = None
 
 # Reuse the compiler's hash function rather than restating it: this loader
 # already drifted once by hashing the bare buffer while the compiler hashes
@@ -90,18 +96,25 @@ def constants_f32() -> dict:
 
 
 # ---------------------------------------------------------------- pack
+def _dev(a: np.ndarray):
+    """Host array -> device representation: mx.array on Metal hosts, as-is on
+    CPU hosts (engine_np consumes numpy directly and accepts mx arrays too,
+    converting at entry, so A/B parity runs work on Metal hosts)."""
+    return mx.array(a) if mx is not None else a
+
+
 @dataclass
 class Pack:
-    """Source-major CSR connectome, on the MLX device."""
+    """Source-major CSR connectome, on the MLX device (numpy on CPU hosts)."""
 
     n_neurons: int
     n_edges: int
-    row_ptr: mx.array        # int32[N+1]
-    destinations: mx.array   # int32[E]
-    signed_counts: mx.array  # int32[E]
-    edge_src: mx.array       # int32[E], expanded from row_ptr
-    neuron_ids: np.ndarray   # int64[N], host-side only
-    out_degree: np.ndarray   # int32[N], host-side only
+    row_ptr: np.ndarray        # int32[N+1]  (mx.array on Metal hosts)
+    destinations: np.ndarray   # int32[E]
+    signed_counts: np.ndarray  # int32[E]
+    edge_src: np.ndarray       # int32[E], expanded from row_ptr
+    neuron_ids: np.ndarray     # int64[N], host-side only
+    out_degree: np.ndarray     # int32[N], host-side only
     manifest: dict
     path: Path | None = None  # the directory it was loaded from, where its sidecars are
 
@@ -135,10 +148,10 @@ def load_pack(pack_dir: Path | str = PACK_DIR, verify_hashes: bool = True) -> Pa
     return Pack(
         n_neurons=n,
         n_edges=e,
-        row_ptr=mx.array(row_ptr),
-        destinations=mx.array(arrays["destinations"]),
-        signed_counts=mx.array(arrays["signed_counts"]),
-        edge_src=mx.array(edge_src),
+        row_ptr=_dev(row_ptr),
+        destinations=_dev(arrays["destinations"]),
+        signed_counts=_dev(arrays["signed_counts"]),
+        edge_src=_dev(edge_src),
         neuron_ids=arrays["neuron_ids"],
         out_degree=out_degree,
         manifest=manifest,
@@ -157,7 +170,7 @@ class Stimulus:
     """
 
     targets: np.ndarray      # int32[K], neuron indices receiving Poisson input, each once
-    draws: mx.array          # bool[T, K]
+    draws: np.ndarray        # bool[T, K]  (mx.array on Metal hosts)
     n_ticks: int
     rate_hz: float           # nan when the draws are not all at one rate
     seed: int
@@ -179,12 +192,13 @@ class Stimulus:
         if (times > 1).any():
             raise ValueError(f"targets listed more than once: {values[times > 1].tolist()}")
         d = self.draws
-        if (not isinstance(d, mx.array) or d.dtype != mx.bool_
+        want = (mx.array, mx.bool_) if mx is not None else (np.ndarray, np.bool_)
+        if (not isinstance(d, want[0]) or d.dtype != want[1]
                 or tuple(d.shape) != (self.n_ticks, t.size)):
             raise ValueError(
-                f"draws must be a bool mx.array of shape ({self.n_ticks}, {t.size}), got "
-                f"{type(d).__name__} dtype={getattr(d, 'dtype', None)} "
-                f"shape={tuple(getattr(d, 'shape', ()))}")
+                f"draws must be a bool {want[0].__module__}.{want[0].__name__} of shape "
+                f"({self.n_ticks}, {t.size}), got {type(d).__name__} "
+                f"dtype={getattr(d, 'dtype', None)} shape={tuple(getattr(d, 'shape', ()))}")
 
     def sha256(self) -> str:
         return hashlib.sha256(np.asarray(self.draws, dtype=np.uint8).tobytes()).hexdigest()
@@ -247,7 +261,7 @@ def make_stimulus_for(
                        rng.random((n_ticks, b.size)) < p_b])
     return Stimulus(
         targets=np.concatenate([a, b]),
-        draws=mx.array(draws),
+        draws=_dev(draws),
         n_ticks=n_ticks,
         rate_hz=rate_hz if b.size == 0 else float("nan"),
         seed=seed,
@@ -255,7 +269,7 @@ def make_stimulus_for(
 
 
 # ---------------------------------------------------------------- silencing
-def silenced_mask(pack: Pack, silenced: np.ndarray | None) -> mx.array | None:
+def silenced_mask(pack: Pack, silenced: np.ndarray | None) -> np.ndarray | None:
     """Validate a per-run silencing mask and put it on the device; None stays None.
 
     Silencing neuron i sets every synapse FROM i to zero weight, which is what
@@ -277,7 +291,7 @@ def silenced_mask(pack: Pack, silenced: np.ndarray | None) -> mx.array | None:
             f"silenced must be a numpy bool array of shape ({pack.n_neurons},), got "
             f"{type(silenced).__name__} dtype={getattr(silenced, 'dtype', None)} "
             f"shape={getattr(silenced, 'shape', None)}")
-    return mx.array(silenced)
+    return mx.array(silenced) if mx is not None else silenced
 
 
 # ---------------------------------------------------------------- state
@@ -292,11 +306,14 @@ def initial_state(pack: Pack, stim: Stimulus) -> dict:
     rfc_reload = np.full(n, RFC_TICKS, dtype=np.int32)
     rfc_reload[stim.targets] = 0
 
-    return {
-        "v": mx.full((n,), V_0, dtype=mx.float32),
-        "g": mx.zeros((n,), dtype=mx.float32),
-        "rfc": mx.zeros((n,), dtype=mx.int32),
-        "rfc_reload": mx.array(rfc_reload),
-        "ring": mx.zeros((DELAY_TICKS, n), dtype=mx.bool_),
-        "counts": mx.zeros((n,), dtype=mx.int32),
+    state = {
+        "v": np.full((n,), V_0, dtype=np.float32),
+        "g": np.zeros((n,), dtype=np.float32),
+        "rfc": np.zeros((n,), dtype=np.int32),
+        "rfc_reload": rfc_reload,
+        "ring": np.zeros((DELAY_TICKS, n), dtype=np.bool_),
+        "counts": np.zeros((n,), dtype=np.int32),
     }
+    if mx is not None:
+        state = {k: mx.array(v) for k, v in state.items()}
+    return state

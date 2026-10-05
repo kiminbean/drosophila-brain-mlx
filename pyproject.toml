@@ -40,12 +40,15 @@ classifiers = [
 ]
 
 dependencies = [
-  "mlx>=0.32.0",
   "numpy>=2.0",
   "pyarrow>=18",
 ]
 
 [project.optional-dependencies]
+# The Metal lanes (engine_naive/chunked/metal/fused) need Apple Silicon;
+# lif.engine_np is pure numpy and runs anywhere, so mlx is an extra. The
+# parity gate (tests + engine_np vs engine_fused A/B) holds the two together.
+metal = ["mlx>=0.32.0"]
 # Only needed to reproduce the validations against Brian2 and against upstream's
 # example notebook, whose utils.py imports pandas; the engines import neither.
 reference = ["brian2>=2.9.0", "pandas>=2.2"]
